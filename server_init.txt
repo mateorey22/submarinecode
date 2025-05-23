@@ -1,0 +1,132 @@
+#!/bin/bash
+
+# Variables (à personnaliser)
+STREAM_PORT=8080
+GITHUB_REPO="https://github.com/mateorey22/submarine-controll"
+REPO_NAME=$(basename "$GITHUB_REPO")
+FLASK_PORT=5000
+LOG_FILE="/home/mateo/submarine_setup.log"
+
+# Fonction pour logger les messages
+log() {
+    echo "$(date) - $1" >> "$LOG_FILE"
+}
+
+# Redirige stdout et stderr vers le fichier de log
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+log "Début de l'installation..."
+
+# 1. Mise à jour et installation des dépendances
+log "Mise à jour et installation des dépendances..."
+sudo apt update
+sudo apt upgrade -y
+sudo apt install -y git python3-pip python3-venv build-essential cmake libjpeg-dev libatlas-base-dev v4l-utils
+
+# 2. Installation de mjpg-streamer
+log "Installation de mjpg-streamer..."
+cd /home/mateo
+if [ -d "mjpg-streamer" ]; then
+    log "mjpg-streamer déjà téléchargé. Suppression..."
+    rm -rf mjpg-streamer
+fi
+
+git clone --depth 1 https://github.com/jacksonliam/mjpg-streamer.git
+cd mjpg-streamer/mjpg-streamer-experimental
+make
+sudo make install
+
+# 3. Configuration de mjpg-streamer (service systemd)
+log "Configuration du service mjpg-streamer..."
+sudo tee /etc/systemd/system/mjpg-streamer.service > /dev/null <<EOF
+[Unit]
+Description=mjpg-streamer
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/mjpg_streamer -i "input_uvc.so -d /dev/video0 -r 1280x720 -f 30" -o "output_http.so -p $STREAM_PORT -w /usr/local/share/mjpg-streamer/www"
+Restart=always
+User=mateo
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl start mjpg-streamer
+sudo systemctl enable mjpg-streamer
+
+# 4. Clonage du dépôt, extraction de api.py, et lancement
+log "Clonage du dépôt GitHub..."
+cd /home/mateo
+if [ -d "$REPO_NAME" ]; then
+  log "Répertoire $REPO_NAME existe déjà. Suppression..."
+  rm -rf "$REPO_NAME"
+fi
+
+git clone --depth 1 "$GITHUB_REPO"  # Clone le dépôt
+cd "$REPO_NAME"
+
+# Vérifie si api.py existe (ajuste le chemin si nécessaire)
+if [ ! -f "api.py" ]; then # <<< MODIFIE CE CHEMIN SI api.py N'EST PAS À LA RACINE
+    log "ERREUR: api.py introuvable dans le dépôt!"
+    exit 1
+fi
+
+log "Installation des dépendances Python (avec environnement virtuel)..."
+python3 -m venv .venv  # Crée l'environnement virtuel
+source .venv/bin/activate  # Active l'environnement virtuel
+pip3 install -r requirements.txt  # Installe les dépendances
+
+log "Lancement de l'API Flask..."
+# Script de démarrage pour l'API (avec activation de l'environnement virtuel et logging)
+cat > /home/mateo/start_api.sh <<EOF
+#!/bin/bash
+cd /home/mateo/$REPO_NAME
+source .venv/bin/activate  # Active l'environnement virtuel
+python3 api.py >> /home/mateo/api.log 2>&1  # Redirige la sortie vers api.log
+EOF
+chmod +x /home/mateo/start_api.sh
+
+# 5. Service systemd pour l'API Flask
+log "Configuration du service pour l'API Flask..."
+sudo tee /etc/systemd/system/submarine-api.service > /dev/null <<EOF
+[Unit]
+Description=Submarine Control API
+After=network-online.target mjpg-streamer.service
+Wants=network-online.target
+
+[Service]
+User=mateo
+WorkingDirectory=/home/mateo/$REPO_NAME
+ExecStart=/home/mateo/start_api.sh
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl start submarine-api
+sudo systemctl enable submarine-api
+
+# 6. Vérification de l'API (utilise un endpoint de test CORRECT!)
+log "Vérification de l'API..."
+sleep 5  # Attendre que l'API démarre
+
+# REMPLACE /api/test par le VRAI endpoint de test de ton API:
+API_TEST_ENDPOINT="/api/test"  # <<< MODIFIE CECI
+
+if ! curl --connect-timeout 5 "http://localhost:$FLASK_PORT$API_TEST_ENDPOINT"; then
+    log "ERREUR: L'API ne répond pas correctement sur le port $FLASK_PORT"
+    exit 1
+else
+    log "SUCCÈS : L'api a été lancée correctement."
+fi
+
+# !!! LA SECTION DE SUPPRESSION DU RÉPERTOIRE A ÉTÉ SUPPRIMÉE !!!
+
+log "Installation terminée."
+log "Accès aux services:"
+log "- Stream vidéo: http://$(hostname -I | awk '{print $1}'):$STREAM_PORT/?action=stream"
+log "- API: http://$(hostname -I | awk '{print $1}'):$FLASK_PORT/"
